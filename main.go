@@ -105,8 +105,8 @@ func main() {
 	// Static files
 	r.PathPrefix("/videos/").Handler(http.StripPrefix("/videos/", http.FileServer(http.Dir("./videos"))))
 
-	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Println("Server started on :8000")
+	log.Fatal(http.ListenAndServe(":8000", r))
 }
 
 func initDB() {
