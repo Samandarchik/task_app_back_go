@@ -59,6 +59,7 @@ type Task struct {
 	VideoURL    *string `json:"videoUrl"`
 	SubmittedAt *string `json:"submittedAt,omitempty"`
 	Date        string  `json:"date"`
+	Days        []int   `json:"days,omitempty"`
 }
 
 type Claims struct {
@@ -83,6 +84,7 @@ func main() {
 
 	// Tasks
 	r.HandleFunc("/api/tasks", authMiddleware(getTasks)).Methods("GET")
+	r.HandleFunc("/api/tasks/all", authMiddleware(getAllTasks)).Methods("GET")
 	r.HandleFunc("/api/tasks", authMiddleware(createTask)).Methods("POST")
 	r.HandleFunc("/api/tasks/{id}", authMiddleware(getTask)).Methods("GET")
 	r.HandleFunc("/api/tasks/{id}", authMiddleware(updateTask)).Methods("PUT")
@@ -151,6 +153,7 @@ func createMainDB() {
 		task TEXT NOT NULL,
 		type INTEGER NOT NULL,
 		filial_ids TEXT NOT NULL,
+		days TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
@@ -211,6 +214,7 @@ func ensureDBForDate(date time.Time) {
 		status INTEGER DEFAULT 1,
 		video_url TEXT,
 		submitted_at DATETIME,
+		days TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
@@ -403,10 +407,11 @@ func getTasks(w http.ResponseWriter, r *http.Request) {
 	var args []interface{}
 
 	if role == RoleWorker {
-		query = "SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at FROM tasks WHERE worker_id = ?"
+		query = "SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at, days FROM tasks WHERE worker_id = ?"
 		args = []interface{}{userID}
 	} else {
-		query = "SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at FROM tasks"
+		// Super admin va checker barcha tasklarni ko'radi
+		query = "SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at, days FROM tasks"
 	}
 
 	rows, err := db.Query(query, args...)
@@ -422,14 +427,85 @@ func getTasks(w http.ResponseWriter, r *http.Request) {
 	tasks := []Task{}
 	for rows.Next() {
 		var t Task
+		var daysStr sql.NullString
 		t.Date = date.Format("2006-01-02")
-		rows.Scan(&t.ID, &t.FilialID, &t.WorkerID, &t.Task, &t.Type, &t.Status, &t.VideoURL, &t.SubmittedAt)
+		rows.Scan(&t.ID, &t.FilialID, &t.WorkerID, &t.Task, &t.Type, &t.Status, &t.VideoURL, &t.SubmittedAt, &daysStr)
+
+		// Parse days if available
+		if daysStr.Valid && daysStr.String != "" {
+			t.Days = parseDays(daysStr.String)
+		}
+
 		tasks = append(tasks, t)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    tasks,
+	})
+}
+
+func getAllTasks(w http.ResponseWriter, r *http.Request) {
+	role := r.Header.Get("Role")
+	if role != RoleSuperAdmin {
+		respondJSON(w, http.StatusForbidden, map[string]interface{}{
+			"success": false,
+			"error":   "Faqat super admin ruxsati",
+		})
+		return
+	}
+
+	mainDB, err := getMainDB()
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"error":   "Database xatosi",
+		})
+		return
+	}
+	defer mainDB.Close()
+
+	rows, err := mainDB.Query("SELECT id, task, type, filial_ids, days, created_at FROM task_templates ORDER BY created_at DESC")
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"error":   "Server xatosi",
+		})
+		return
+	}
+	defer rows.Close()
+
+	type TaskTemplate struct {
+		ID        int    `json:"templateId"`
+		Task      string `json:"task"`
+		Type      int    `json:"type"`
+		FilialIDs []int  `json:"filialIds"`
+		Days      []int  `json:"days,omitempty"`
+		CreatedAt string `json:"createdAt"`
+	}
+
+	templates := []TaskTemplate{}
+	for rows.Next() {
+		var t TaskTemplate
+		var filialIDsStr, daysStr, createdAt string
+		rows.Scan(&t.ID, &t.Task, &t.Type, &filialIDsStr, &daysStr, &createdAt)
+
+		// Parse filial IDs
+		t.FilialIDs = parseFilialIDs(filialIDsStr)
+
+		// Parse days if available
+		if daysStr != "" {
+			t.Days = parseDays(daysStr)
+		}
+
+		t.CreatedAt = createdAt
+		templates = append(templates, t)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    templates,
+		"total":   len(templates),
 	})
 }
 
@@ -447,6 +523,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		FilialIDs []int  `json:"filialIds"`
 		Task      string `json:"task"`
 		Type      int    `json:"type"`
+		Days      []int  `json:"days"` // Yangi field
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -457,13 +534,43 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate days based on task type
+	if req.Type == TypeWeekly {
+		for _, day := range req.Days {
+			if day < 1 || day > 7 {
+				respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+					"success": false,
+					"error":   "Hafta kunlari 1-7 oralig'ida bo'lishi kerak",
+				})
+				return
+			}
+		}
+	} else if req.Type == TypeMonthly {
+		for _, day := range req.Days {
+			if day < 1 || day > 31 {
+				respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+					"success": false,
+					"error":   "Oy kunlari 1-31 oralig'ida bo'lishi kerak",
+				})
+				return
+			}
+		}
+	}
+
 	// Save template
 	mainDB, _ := getMainDB()
 	defer mainDB.Close()
 
 	filialIDsStr := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.FilialIDs)), ","), "[]")
-	result, err := mainDB.Exec("INSERT INTO task_templates (task, type, filial_ids) VALUES (?, ?, ?)",
-		req.Task, req.Type, filialIDsStr)
+
+	// Convert days to string
+	daysStr := ""
+	if len(req.Days) > 0 {
+		daysStr = strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.Days)), ","), "[]")
+	}
+
+	result, err := mainDB.Exec("INSERT INTO task_templates (task, type, filial_ids, days) VALUES (?, ?, ?, ?)",
+		req.Task, req.Type, filialIDsStr, daysStr)
 
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -475,8 +582,32 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 
 	templateID, _ := result.LastInsertId()
 
-	// Create tasks for today
-	created := createTasksForDate(req.Task, req.Type, req.FilialIDs, time.Now())
+	// Create tasks for today if applicable
+	created := 0
+	if req.Type == TypeDaily {
+		created = createTasksForDate(req.Task, req.Type, req.FilialIDs, req.Days, time.Now())
+	} else if req.Type == TypeWeekly {
+		// Check if today matches any of the specified days
+		today := int(time.Now().Weekday())
+		if today == 0 {
+			today = 7 // Sunday = 7
+		}
+		for _, day := range req.Days {
+			if day == today {
+				created = createTasksForDate(req.Task, req.Type, req.FilialIDs, req.Days, time.Now())
+				break
+			}
+		}
+	} else if req.Type == TypeMonthly {
+		// Check if today matches any of the specified days
+		today := time.Now().Day()
+		for _, day := range req.Days {
+			if day == today {
+				created = createTasksForDate(req.Task, req.Type, req.FilialIDs, req.Days, time.Now())
+				break
+			}
+		}
+	}
 
 	respondJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
@@ -501,9 +632,10 @@ func getTask(w http.ResponseWriter, r *http.Request) {
 	defer db.Close()
 
 	var task Task
+	var daysStr sql.NullString
 	task.Date = date.Format("2006-01-02")
-	err := db.QueryRow("SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at FROM tasks WHERE id = ?", id).
-		Scan(&task.ID, &task.FilialID, &task.WorkerID, &task.Task, &task.Type, &task.Status, &task.VideoURL, &task.SubmittedAt)
+	err := db.QueryRow("SELECT id, filial_id, worker_id, task, type, status, video_url, submitted_at, days FROM tasks WHERE id = ?", id).
+		Scan(&task.ID, &task.FilialID, &task.WorkerID, &task.Task, &task.Type, &task.Status, &task.VideoURL, &task.SubmittedAt, &daysStr)
 
 	if err != nil {
 		respondJSON(w, http.StatusNotFound, map[string]interface{}{
@@ -511,6 +643,11 @@ func getTask(w http.ResponseWriter, r *http.Request) {
 			"error":   "Vazifa topilmadi",
 		})
 		return
+	}
+
+	// Parse days if available
+	if daysStr.Valid && daysStr.String != "" {
+		task.Days = parseDays(daysStr.String)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -533,8 +670,12 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 	id := vars["id"]
 
 	var req struct {
-		Task string `json:"task"`
-		Type int    `json:"type"`
+		Task     string `json:"task"`
+		Type     int    `json:"type"`
+		Status   *int   `json:"status,omitempty"`
+		FilialID *int   `json:"filialId,omitempty"`
+		WorkerID *int   `json:"workerId,omitempty"`
+		Days     []int  `json:"days,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -545,10 +686,71 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db, _ := getTaskDB(time.Now())
+	// Validate days based on task type
+	if len(req.Days) > 0 {
+		if req.Type == TypeWeekly {
+			for _, day := range req.Days {
+				if day < 1 || day > 7 {
+					respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+						"success": false,
+						"error":   "Hafta kunlari 1-7 oralig'ida bo'lishi kerak",
+					})
+					return
+				}
+			}
+		} else if req.Type == TypeMonthly {
+			for _, day := range req.Days {
+				if day < 1 || day > 31 {
+					respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+						"success": false,
+						"error":   "Oy kunlari 1-31 oralig'ida bo'lishi kerak",
+					})
+					return
+				}
+			}
+		}
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	var date time.Time
+	if dateStr == "" {
+		date = time.Now()
+	} else {
+		date, _ = time.Parse("2006-01-02", dateStr)
+	}
+
+	db, _ := getTaskDB(date)
 	defer db.Close()
 
-	_, err := db.Exec("UPDATE tasks SET task = ?, type = ? WHERE id = ?", req.Task, req.Type, id)
+	// Build dynamic update query
+	updateFields := []string{"task = ?", "type = ?"}
+	args := []interface{}{req.Task, req.Type}
+
+	if req.Status != nil {
+		updateFields = append(updateFields, "status = ?")
+		args = append(args, *req.Status)
+	}
+
+	if req.FilialID != nil {
+		updateFields = append(updateFields, "filial_id = ?")
+		args = append(args, *req.FilialID)
+	}
+
+	if req.WorkerID != nil {
+		updateFields = append(updateFields, "worker_id = ?")
+		args = append(args, *req.WorkerID)
+	}
+
+	if len(req.Days) > 0 {
+		daysStr := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.Days)), ","), "[]")
+		updateFields = append(updateFields, "days = ?")
+		args = append(args, daysStr)
+	}
+
+	args = append(args, id)
+	query := fmt.Sprintf("UPDATE tasks SET %s WHERE id = ?", strings.Join(updateFields, ", "))
+
+	_, err := db.Exec(query, args...)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
@@ -575,7 +777,15 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	db, _ := getTaskDB(time.Now())
+	dateStr := r.URL.Query().Get("date")
+	var date time.Time
+	if dateStr == "" {
+		date = time.Now()
+	} else {
+		date, _ = time.Parse("2006-01-02", dateStr)
+	}
+
+	db, _ := getTaskDB(date)
 	defer db.Close()
 
 	_, err := db.Exec("DELETE FROM tasks WHERE id = ?", id)
@@ -900,16 +1110,8 @@ func startScheduler() {
 
 			ensureTodayDB()
 			createDailyTasks()
-
-			if now.Weekday() == time.Monday {
-				log.Println("Creating weekly tasks...")
-				createWeeklyTasks()
-			}
-
-			if now.Day() == 1 {
-				log.Println("Creating monthly tasks...")
-				createMonthlyTasks()
-			}
+			createWeeklyTasks()
+			createMonthlyTasks()
 
 			log.Println("=== Task creation completed ===")
 		}
@@ -951,7 +1153,7 @@ func createDailyTasks() {
 		rows.Scan(&task, &filialIDs)
 
 		ids := parseFilialIDs(filialIDs)
-		created := createTasksForDate(task, TypeDaily, ids, time.Now())
+		created := createTasksForDate(task, TypeDaily, ids, nil, time.Now())
 		log.Printf("Daily task '%s': created %d tasks\n", task, created)
 	}
 }
@@ -960,20 +1162,38 @@ func createWeeklyTasks() {
 	mainDB, _ := getMainDB()
 	defer mainDB.Close()
 
-	rows, err := mainDB.Query("SELECT task, filial_ids FROM task_templates WHERE type = ?", TypeWeekly)
+	rows, err := mainDB.Query("SELECT task, filial_ids, days FROM task_templates WHERE type = ?", TypeWeekly)
 	if err != nil {
 		log.Printf("Error loading weekly templates: %v\n", err)
 		return
 	}
 	defer rows.Close()
 
-	for rows.Next() {
-		var task, filialIDs string
-		rows.Scan(&task, &filialIDs)
+	today := int(time.Now().Weekday())
+	if today == 0 {
+		today = 7 // Sunday = 7
+	}
 
-		ids := parseFilialIDs(filialIDs)
-		created := createTasksForDate(task, TypeWeekly, ids, time.Now())
-		log.Printf("Weekly task '%s': created %d tasks\n", task, created)
+	for rows.Next() {
+		var task, filialIDs, daysStr string
+		rows.Scan(&task, &filialIDs, &daysStr)
+
+		days := parseDays(daysStr)
+
+		// Check if today is in the allowed days
+		shouldCreate := false
+		for _, day := range days {
+			if day == today {
+				shouldCreate = true
+				break
+			}
+		}
+
+		if shouldCreate {
+			ids := parseFilialIDs(filialIDs)
+			created := createTasksForDate(task, TypeWeekly, ids, days, time.Now())
+			log.Printf("Weekly task '%s': created %d tasks\n", task, created)
+		}
 	}
 }
 
@@ -981,20 +1201,35 @@ func createMonthlyTasks() {
 	mainDB, _ := getMainDB()
 	defer mainDB.Close()
 
-	rows, err := mainDB.Query("SELECT task, filial_ids FROM task_templates WHERE type = ?", TypeMonthly)
+	rows, err := mainDB.Query("SELECT task, filial_ids, days FROM task_templates WHERE type = ?", TypeMonthly)
 	if err != nil {
 		log.Printf("Error loading monthly templates: %v\n", err)
 		return
 	}
 	defer rows.Close()
 
-	for rows.Next() {
-		var task, filialIDs string
-		rows.Scan(&task, &filialIDs)
+	today := time.Now().Day()
 
-		ids := parseFilialIDs(filialIDs)
-		created := createTasksForDate(task, TypeMonthly, ids, time.Now())
-		log.Printf("Monthly task '%s': created %d tasks\n", task, created)
+	for rows.Next() {
+		var task, filialIDs, daysStr string
+		rows.Scan(&task, &filialIDs, &daysStr)
+
+		days := parseDays(daysStr)
+
+		// Check if today is in the allowed days
+		shouldCreate := false
+		for _, day := range days {
+			if day == today {
+				shouldCreate = true
+				break
+			}
+		}
+
+		if shouldCreate {
+			ids := parseFilialIDs(filialIDs)
+			created := createTasksForDate(task, TypeMonthly, ids, days, time.Now())
+			log.Printf("Monthly task '%s': created %d tasks\n", task, created)
+		}
 	}
 }
 
@@ -1010,7 +1245,23 @@ func parseFilialIDs(filialIDs string) []int {
 	return result
 }
 
-func createTasksForDate(task string, taskType int, filialIDs []int, date time.Time) int {
+func parseDays(daysStr string) []int {
+	if daysStr == "" {
+		return []int{}
+	}
+
+	days := strings.Split(daysStr, ",")
+	result := []int{}
+	for _, day := range days {
+		val, _ := strconv.Atoi(strings.TrimSpace(day))
+		if val > 0 {
+			result = append(result, val)
+		}
+	}
+	return result
+}
+
+func createTasksForDate(task string, taskType int, filialIDs []int, days []int, date time.Time) int {
 	taskDB, err := getTaskDB(date)
 	if err != nil {
 		log.Printf("Error opening task DB: %v\n", err)
@@ -1022,6 +1273,12 @@ func createTasksForDate(task string, taskType int, filialIDs []int, date time.Ti
 	defer mainDB.Close()
 
 	created := 0
+
+	// Convert days to string for storage
+	daysStr := ""
+	if len(days) > 0 {
+		daysStr = strings.Trim(strings.Join(strings.Fields(fmt.Sprint(days)), ","), "[]")
+	}
 
 	for _, filialID := range filialIDs {
 		var workerID int
@@ -1041,8 +1298,8 @@ func createTasksForDate(task string, taskType int, filialIDs []int, date time.Ti
 			continue
 		}
 
-		result, err := taskDB.Exec("INSERT INTO tasks (filial_id, worker_id, task, type, status) VALUES (?, ?, ?, ?, ?)",
-			filialID, workerID, task, taskType, StatusNotDone)
+		result, err := taskDB.Exec("INSERT INTO tasks (filial_id, worker_id, task, type, status, days) VALUES (?, ?, ?, ?, ?, ?)",
+			filialID, workerID, task, taskType, StatusNotDone, daysStr)
 
 		if err != nil {
 			log.Printf("Error creating task (filial=%d, worker=%d): %v\n", filialID, workerID, err)
@@ -1147,19 +1404,20 @@ func getDebugInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get templates
-	rows2, _ := mainDB.Query("SELECT id, task, type, filial_ids FROM task_templates")
+	rows2, _ := mainDB.Query("SELECT id, task, type, filial_ids, days FROM task_templates")
 	defer rows2.Close()
 
 	templates := []map[string]interface{}{}
 	for rows2.Next() {
 		var id, taskType int
-		var task, filialIDs string
-		rows2.Scan(&id, &task, &taskType, &filialIDs)
+		var task, filialIDs, daysStr string
+		rows2.Scan(&id, &task, &taskType, &filialIDs, &daysStr)
 		templates = append(templates, map[string]interface{}{
 			"id":        id,
 			"task":      task,
 			"type":      taskType,
 			"filialIds": filialIDs,
+			"days":      daysStr,
 		})
 	}
 
