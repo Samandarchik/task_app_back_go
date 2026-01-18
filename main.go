@@ -670,12 +670,12 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 	id := vars["id"]
 
 	var req struct {
-		Task     string `json:"task"`
-		Type     int    `json:"type"`
-		Status   *int   `json:"status,omitempty"`
-		FilialID *int   `json:"filialId,omitempty"`
-		WorkerID *int   `json:"workerId,omitempty"`
-		Days     []int  `json:"days,omitempty"`
+		Task      string `json:"task"`
+		Type      int    `json:"type"`
+		Status    *int   `json:"status,omitempty"`
+		FilialIDs []int  `json:"filialIds,omitempty"`
+		WorkerID  *int   `json:"workerId,omitempty"`
+		Days      []int  `json:"days,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -711,6 +711,38 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Update main database template
+	mainDB, _ := getMainDB()
+	defer mainDB.Close()
+
+	mainUpdateFields := []string{"task = ?", "type = ?"}
+	mainArgs := []interface{}{req.Task, req.Type}
+
+	if len(req.FilialIDs) > 0 {
+		filialIDsStr := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.FilialIDs)), ","), "[]")
+		mainUpdateFields = append(mainUpdateFields, "filial_ids = ?")
+		mainArgs = append(mainArgs, filialIDsStr)
+	}
+
+	if len(req.Days) > 0 {
+		daysStr := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.Days)), ","), "[]")
+		mainUpdateFields = append(mainUpdateFields, "days = ?")
+		mainArgs = append(mainArgs, daysStr)
+	}
+
+	mainArgs = append(mainArgs, id)
+	mainQuery := fmt.Sprintf("UPDATE task_templates SET %s WHERE id = ?", strings.Join(mainUpdateFields, ", "))
+
+	_, err := mainDB.Exec(mainQuery, mainArgs...)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"error":   "Template yangilashda xato",
+		})
+		return
+	}
+
+	// Update today's task database if date is provided or default to today
 	dateStr := r.URL.Query().Get("date")
 	var date time.Time
 	if dateStr == "" {
@@ -719,48 +751,41 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 		date, _ = time.Parse("2006-01-02", dateStr)
 	}
 
-	db, _ := getTaskDB(date)
-	defer db.Close()
+	taskDB, _ := getTaskDB(date)
+	defer taskDB.Close()
 
-	// Build dynamic update query
-	updateFields := []string{"task = ?", "type = ?"}
-	args := []interface{}{req.Task, req.Type}
+	// Build dynamic update query for task database
+	taskUpdateFields := []string{"task = ?", "type = ?"}
+	taskArgs := []interface{}{req.Task, req.Type}
 
 	if req.Status != nil {
-		updateFields = append(updateFields, "status = ?")
-		args = append(args, *req.Status)
-	}
-
-	if req.FilialID != nil {
-		updateFields = append(updateFields, "filial_id = ?")
-		args = append(args, *req.FilialID)
+		taskUpdateFields = append(taskUpdateFields, "status = ?")
+		taskArgs = append(taskArgs, *req.Status)
 	}
 
 	if req.WorkerID != nil {
-		updateFields = append(updateFields, "worker_id = ?")
-		args = append(args, *req.WorkerID)
+		taskUpdateFields = append(taskUpdateFields, "worker_id = ?")
+		taskArgs = append(taskArgs, *req.WorkerID)
 	}
 
 	if len(req.Days) > 0 {
 		daysStr := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(req.Days)), ","), "[]")
-		updateFields = append(updateFields, "days = ?")
-		args = append(args, daysStr)
+		taskUpdateFields = append(taskUpdateFields, "days = ?")
+		taskArgs = append(taskArgs, daysStr)
 	}
 
-	args = append(args, id)
-	query := fmt.Sprintf("UPDATE tasks SET %s WHERE id = ?", strings.Join(updateFields, ", "))
+	// Update all tasks with matching template task name
+	taskArgs = append(taskArgs, req.Task)
+	taskQuery := fmt.Sprintf("UPDATE tasks SET %s WHERE task = ?", strings.Join(taskUpdateFields, ", "))
 
-	_, err := db.Exec(query, args...)
+	_, err = taskDB.Exec(taskQuery, taskArgs...)
 	if err != nil {
-		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"success": false,
-			"error":   "Server xatosi",
-		})
-		return
+		log.Printf("Task yangilashda xato: %v\n", err)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
+		"message": "Template va tegishli tasklar yangilandi",
 	})
 }
 
@@ -777,6 +802,32 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
+	// Delete from main database (task_templates)
+	mainDB, _ := getMainDB()
+	defer mainDB.Close()
+
+	// Get task name before deleting to remove from daily databases
+	var taskName string
+	err := mainDB.QueryRow("SELECT task FROM task_templates WHERE id = ?", id).Scan(&taskName)
+	if err != nil {
+		respondJSON(w, http.StatusNotFound, map[string]interface{}{
+			"success": false,
+			"error":   "Template topilmadi",
+		})
+		return
+	}
+
+	// Delete from main database
+	_, err = mainDB.Exec("DELETE FROM task_templates WHERE id = ?", id)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"success": false,
+			"error":   "Template o'chirishda xato",
+		})
+		return
+	}
+
+	// Delete from today's task database
 	dateStr := r.URL.Query().Get("date")
 	var date time.Time
 	if dateStr == "" {
@@ -785,20 +836,18 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 		date, _ = time.Parse("2006-01-02", dateStr)
 	}
 
-	db, _ := getTaskDB(date)
-	defer db.Close()
+	taskDB, _ := getTaskDB(date)
+	defer taskDB.Close()
 
-	_, err := db.Exec("DELETE FROM tasks WHERE id = ?", id)
+	// Delete all tasks with this task name
+	_, err = taskDB.Exec("DELETE FROM tasks WHERE task = ?", taskName)
 	if err != nil {
-		respondJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"success": false,
-			"error":   "Server xatosi",
-		})
-		return
+		log.Printf("Kunlik tasklar o'chirishda xato: %v\n", err)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
+		"message": "Template va tegishli tasklar o'chirildi",
 	})
 }
 
